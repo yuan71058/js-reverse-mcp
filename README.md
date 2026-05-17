@@ -4,16 +4,18 @@ English | [中文](README_zh.md)
 
 A JavaScript reverse engineering MCP server that enables AI coding assistants (Claude, Cursor, Copilot) to debug and analyze JavaScript code in web pages.
 
-Built on the [Patchright](https://github.com/nicecaesar/patchright) anti-detection engine with multi-layered anti-bot bypass capabilities, allowing it to work on sites with bot detection such as Zhihu and Google.
+Built on the [Patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright-nodejs) protocol-layer anti-detection, with an optional [CloakBrowser](https://github.com/CloakHQ/CloakBrowser) source-level fingerprint mode for strong anti-bot sites. Headed mode, persistent login, and zero JS injection — looks and behaves like a real Chrome.
 
 ## Features
 
-- **Anti-detection browser**: Based on Patchright (Playwright anti-detection fork), 60+ stealth launch arguments, bypasses mainstream anti-bot systems
-- **Script analysis**: List all loaded JS scripts, search code, get/save source code
-- **Breakpoint debugging**: Set/remove breakpoints, conditional breakpoints, precise positioning in minified code
-- **Execution control**: Pause/resume execution, step debugging (over/into/out) with source context
-- **Runtime inspection**: Evaluate expressions at breakpoints, inspect scope variables
-- **Network analysis**: View request initiator call stacks, set XHR breakpoints, WebSocket message analysis
+- **Headed debugging by default**: see the browser, set breakpoints, step through JS — the way a real reverse engineer works
+- **Persistent login state**: cookies and localStorage survive across sessions
+- **Two-layer anti-detection**: Patchright avoids `Runtime.enable`/`Console.enable` CDP leaks at the protocol level; opt-in `--cloak` adds 49 source-level C++ fingerprint patches (canvas, WebGL, audio, GPU, fonts) via the CloakBrowser binary
+- **Script analysis**: list all loaded JS scripts, search code, get/save source
+- **Breakpoint debugging**: set/remove breakpoints, conditional breakpoints, precise positioning in minified code
+- **Execution control**: pause/resume, step over/into/out with source context in response
+- **Runtime inspection**: evaluate at breakpoints, inspect scope variables
+- **Network analysis**: request initiator call stacks, XHR breakpoints, WebSocket message analysis
 
 ## Requirements
 
@@ -81,18 +83,22 @@ Then use local path in your MCP configuration:
 
 ## Anti-Detection
 
-js-reverse-mcp includes multi-layered anti-detection measures to work on sites with bot detection:
+Stealth in this project is cleanly layered. The wrapper itself injects **zero** JavaScript and runs no `Object.defineProperty` hacks — those would themselves become detectable. All anti-detection happens in two well-separated layers:
 
-### Anti-Detection Architecture
+| Layer | Default mode | `--cloak` mode |
+| --- | --- | --- |
+| **Protocol layer** (CDP) | Patchright: skips `Runtime.enable`/`Console.enable`, evaluates in isolated worlds, strips automation launch flags | Same |
+| **Source layer** (C++ binary patches) | None — uses system Google Chrome as-is | CloakBrowser binary (49 C++ patches: `navigator.webdriver`, canvas, WebGL, audio, GPU, fonts, screen, WebRTC, TLS) |
+| **Profile directory** | `~/.cache/chrome-devtools-mcp/chrome-profile` (persistent login) | `~/.cache/chrome-devtools-mcp/cloak-profile` (physically isolated from the default) |
+| **Browser used** | Your installed Google Chrome (with Web Store, extensions, sync) | Custom Chromium build (no Google services, no Web Store) |
 
-| Layer                   | Description                                                                                                                                                                    |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Patchright Engine       | C++ level anti-detection patches, removes `navigator.webdriver`, avoids `Runtime.enable` leaks                                                                                 |
-| 60+ Stealth Args        | Removes automation signatures, bypasses headless detection, GPU/network/behavior fingerprint spoofing                                                                          |
-| Harmful Args Removal    | Excludes `--enable-automation` and 4 other default Playwright arguments                                                                                                        |
-| Silent CDP Navigation   | Navigation tools don't activate CDP domains, captures requests only through Playwright-level listeners, preventing anti-bot scripts from detecting debugging protocol activity |
-| Google Referer Spoofing | All navigations automatically include `referer: https://www.google.com/`                                                                                                       |
-| Persistent Login State  | Uses persistent user-data-dir by default, login state preserved across sessions                                                                                                |
+Other navigation-level safeguards (both modes):
+
+- **Silent CDP navigation** — page-load tools never call `Network.enable` / `Debugger.enable`, request/console collection is purely Playwright-level until a tool explicitly needs CDP
+- **Google referer** — `new_page` sends `referer: https://www.google.com/` by default
+- **Real OS viewport** — Playwright's fake 1280×720 viewport is disabled; the browser shows your real screen size
+
+When to enable `--cloak`: only for sites that block you on fingerprint despite all of the above. See [docs/cloak.en.md](docs/cloak.en.md) for the full guide and tradeoffs.
 
 ## Tools (21)
 
@@ -178,38 +184,67 @@ List WebSocket connections, analyze message patterns, view messages of specific 
 
 ## Configuration Options
 
-| Option                 | Description                                         | Default   |
-| ---------------------- | --------------------------------------------------- | --------- |
-| `--browserUrl, -u`     | Connect to a running Chrome instance                | -         |
-| `--wsEndpoint, -w`     | WebSocket endpoint connection                       | -         |
-| `--headless`           | Run in headless mode                                | false     |
-| `--executablePath, -e` | Custom Chrome executable path                       | -         |
-| `--isolated`           | Use temporary user data directory (fresh each time) | false     |
-| `--channel`            | Chrome channel: stable, canary, beta, dev           | stable    |
-| `--viewport`           | Initial viewport size, e.g. `1280x720`              | real size |
-| `--hideCanvas`         | Enable Canvas fingerprint noise                     | false     |
-| `--blockWebrtc`        | Block WebRTC to prevent real IP leaks               | false     |
-| `--disableWebgl`       | Disable WebGL to prevent GPU fingerprinting         | false     |
-| `--noStealth`          | Disable stealth launch arguments (for debugging)    | false     |
-| `--proxyServer`        | Proxy server configuration                          | -         |
-| `--logFile`            | Debug log file path                                 | -         |
+The CLI is intentionally minimal — four flags, all optional. Default behavior is what you want 99% of the time.
+
+| Option | Description | Default |
+| --- | --- | --- |
+| `--cloak` | Use CloakBrowser stealth-patched Chromium binary instead of system Chrome. Adds 49 source-level C++ fingerprint patches. Binary auto-downloads (~200MB) on first use. Identity is persisted per profile. See [docs/cloak.en.md](docs/cloak.en.md). | `false` |
+| `--isolated` | Use a temporary user data directory (cookies/localStorage not persisted, auto-cleaned on close) | `false` |
+| `--browserUrl, -u` | Connect to a running Chrome instance via CDP HTTP endpoint (e.g. `http://127.0.0.1:9222`). The MCP probes it to find the WebSocket debugger URL. | – |
+| `--logFile` | Path to write debug logs (also set env `DEBUG=*` for verbose logs) | – |
 
 ### Example Configurations
 
-**Enhanced anti-detection (Canvas noise + WebRTC blocking):**
+**Default — system Chrome with persistent login** (recommended for most debugging):
 
 ```json
 {
   "mcpServers": {
     "js-reverse": {
       "command": "npx",
-      "args": ["js-reverse-mcp", "--hideCanvas", "--blockWebrtc"]
+      "args": ["js-reverse-mcp"]
     }
   }
 }
 ```
 
-**Isolated mode (no persistent login, fresh profile each time):**
+**`--cloak` — strong anti-bot sites** (Cloudflare Turnstile / FingerprintJS / DataDome):
+
+> **Strongly recommended: pre-download the binary first** (one-time, ~30–60 seconds). Without this, the first `--cloak` MCP launch silently downloads ~200MB and looks like the server is hanging:
+> ```bash
+> npx cloakbrowser install
+> ```
+> The `cloakbrowser` package is already pulled in via `optionalDependencies`; this command just triggers its built-in binary download with a visible progress bar.
+
+```json
+{
+  "mcpServers": {
+    "js-reverse-cloak": {
+      "command": "npx",
+      "args": ["js-reverse-mcp", "--cloak"]
+    }
+  }
+}
+```
+
+**Both at once** — separate MCP instances with isolated profiles, pick the right one for the target site:
+
+```json
+{
+  "mcpServers": {
+    "js-reverse": {
+      "command": "npx",
+      "args": ["js-reverse-mcp"]
+    },
+    "js-reverse-cloak": {
+      "command": "npx",
+      "args": ["js-reverse-mcp", "--cloak"]
+    }
+  }
+}
+```
+
+**`--isolated` — clean profile every run** (no cookies/localStorage persisted):
 
 ```json
 {
@@ -224,7 +259,9 @@ List WebSocket connections, analyze message patterns, view messages of specific 
 
 ### Connect to a Running Chrome Instance
 
-1. Launch Chrome (close all Chrome windows first, then restart):
+If you'd rather reuse a Chrome already running on your machine (e.g. you have a long-lived session you don't want to disturb), launch Chrome with the remote debugging port and connect to it:
+
+1. Launch Chrome (close other Chrome windows first):
 
 **macOS**
 
@@ -245,7 +282,7 @@ List WebSocket connections, analyze message patterns, view messages of specific 
   "mcpServers": {
     "js-reverse": {
       "command": "npx",
-      "args": ["js-reverse-mcp", "--browser-url=http://127.0.0.1:9222"]
+      "args": ["js-reverse-mcp", "--browserUrl", "http://127.0.0.1:9222"]
     }
   }
 }
@@ -253,13 +290,24 @@ List WebSocket connections, analyze message patterns, view messages of specific 
 
 ## Troubleshooting
 
-### Blocked by Anti-Bot Systems
+### Blocked by anti-bot systems
 
-If you are blocked when visiting certain sites (e.g. Zhihu returning error 40362):
+If a site blocks you (e.g. Zhihu returning error 40362, Cloudflare challenge looping):
 
-1. **Clear the contaminated profile**: Delete the `~/.cache/chrome-devtools-mcp/chrome-profile` directory
-2. **Use isolated mode**: Add the `--isolated` flag
-3. **Enable Canvas noise**: Add the `--hideCanvas` flag
+1. **Try `--isolated` first** — wipes any contaminated state from previous runs:
+   ```json
+   "args": ["js-reverse-mcp", "--isolated"]
+   ```
+2. **If that doesn't help, enable `--cloak`** — adds 49 source-level fingerprint patches:
+   ```json
+   "args": ["js-reverse-mcp", "--cloak"]
+   ```
+3. **Manually clear the persistent profile** (last resort, deletes your saved logins):
+   ```bash
+   rm -rf ~/.cache/chrome-devtools-mcp/chrome-profile
+   ```
+
+See [docs/cloak.en.md](docs/cloak.en.md) for when `--cloak` is the right call (and when it isn't).
 
 ## Security Notice
 

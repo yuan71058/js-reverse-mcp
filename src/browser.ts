@@ -8,8 +8,8 @@ import type fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import {setupCloak} from './cloak.js';
 import {logger} from './logger.js';
-import {DEFAULT_ARGS, STEALTH_ARGS, HARMFUL_ARGS} from './stealth-args.js';
 import type {
   Browser,
   BrowserContext,
@@ -23,37 +23,38 @@ export interface BrowserResult {
 
 let browserResult: BrowserResult | undefined;
 
-// Default persistent user data directory for login state, cookies, etc.
+// Persistent user data directories.
+//
+// IMPORTANT: cloak and non-cloak profiles MUST be physically isolated. They
+// use different Chromium binaries with different feature sets — mixing state
+// (extensions, shader cache, service workers) across them causes startup
+// races and broken sessions. Pick the directory based on whether --cloak is
+// set; never share.
+//
+// NOTE: the default path is preserved across the chrome-devtools-mcp →
+// js-reverse-mcp rename so existing users keep their login state.
 const DEFAULT_USER_DATA_DIR = path.join(os.homedir(), '.cache', 'chrome-devtools-mcp', 'chrome-profile');
+const DEFAULT_CLOAK_DATA_DIR = path.join(os.homedir(), '.cache', 'chrome-devtools-mcp', 'cloak-profile');
 
 export async function ensureBrowserConnected(options: {
   browserURL?: string;
-  wsEndpoint?: string;
-  wsHeaders?: Record<string, string>;
-  devtools: boolean;
 }): Promise<BrowserResult> {
   if (browserResult) {
     return browserResult;
   }
 
-  let endpoint = options.wsEndpoint;
-
-  // If browserURL is given (e.g. http://localhost:9222), resolve to ws endpoint
-  if (!endpoint && options.browserURL) {
-    const url = new URL('/json/version', options.browserURL);
-    const res = await fetch(url.toString());
-    const json = (await res.json()) as {webSocketDebuggerUrl: string};
-    endpoint = json.webSocketDebuggerUrl;
+  if (!options.browserURL) {
+    throw new Error('browserURL must be provided');
   }
 
-  if (!endpoint) {
-    throw new Error('Either browserURL or wsEndpoint must be provided');
-  }
+  // Resolve the WebSocket debugger URL from the CDP HTTP endpoint.
+  const url = new URL('/json/version', options.browserURL);
+  const res = await fetch(url.toString());
+  const json = (await res.json()) as {webSocketDebuggerUrl: string};
+  const endpoint = json.webSocketDebuggerUrl;
 
   logger('Connecting Patchright via CDP to', endpoint);
-  const browser = await chromium.connectOverCDP(endpoint, {
-    headers: options.wsHeaders,
-  });
+  const browser = await chromium.connectOverCDP(endpoint);
   logger('Connected Patchright');
 
   const context = browser.contexts()[0];
@@ -73,98 +74,66 @@ export async function ensureBrowserConnected(options: {
 }
 
 interface McpLaunchOptions {
-  acceptInsecureCerts?: boolean;
-  executablePath?: string;
-  channel?: Channel;
   userDataDir?: string;
-  headless: boolean;
   isolated: boolean;
   logFile?: fs.WriteStream;
-  viewport?: {
-    width: number;
-    height: number;
-  };
-  args?: string[];
-  devtools: boolean;
-  hideCanvas?: boolean;
-  blockWebrtc?: boolean;
-  disableWebgl?: boolean;
-  noStealth?: boolean;
+  cloak?: boolean;
 }
 
 export async function launch(options: McpLaunchOptions): Promise<BrowserResult> {
-  const {channel, executablePath, headless, isolated} = options;
+  const {isolated} = options;
+
+  // --cloak: resolve the CloakBrowser binary and fingerprint seed before
+  // anything else. For persistent profiles the seed is persisted there so the
+  // virtual identity is stable across launches; --isolated gets a fresh seed.
+  //
+  // Cloak and non-cloak modes use SEPARATE persistent profile directories —
+  // they're different browsers with different feature sets, sharing profile
+  // state breaks both.
+  const persistentProfileDir = isolated
+    ? undefined
+    : (options.userDataDir
+        ?? (options.cloak ? DEFAULT_CLOAK_DATA_DIR : DEFAULT_USER_DATA_DIR));
+  const cloakSetup = options.cloak
+    ? await setupCloak(persistentProfileDir)
+    : null;
+  const executablePath = cloakSetup?.executablePath;
 
   const args: string[] = [
-    ...DEFAULT_ARGS,
-    ...(options.noStealth ? [] : STEALTH_ARGS),
-    ...(options.args ?? []),
+    // UX flags (not stealth):
+    //   --test-type tells Chrome it's running under an automation harness,
+    //   which suppresses ALL "unsupported command-line flag" yellow banners
+    //   that would otherwise appear for every flag Patchright/cloak add
+    //   (--no-sandbox, --disable-blink-features=AutomationControlled,
+    //   --disable-features=..., etc.). Without this you get a fresh banner
+    //   on top of every page. Do NOT remove as part of any "stealth cleanup":
+    //   this is purely a banner suppressor, not a config-level fingerprint.
+    //   --hide-crash-restore-bubble hides the "Chrome didn't shut down
+    //   correctly" bubble that appears whenever the MCP is killed/restarted.
+    '--test-type',
     '--hide-crash-restore-bubble',
+    ...(cloakSetup?.args ?? []),
   ];
-  if (headless) {
-    args.push('--screen-info={3840x2160}');
-  }
-  if (options.devtools) {
-    args.push('--auto-open-devtools-for-tabs');
-  }
-  if (options.hideCanvas) {
-    args.push('--fingerprinting-canvas-image-data-noise');
-  }
-  if (options.blockWebrtc) {
-    args.push(
-      '--webrtc-ip-handling-policy=disable_non_proxied_udp',
-      '--force-webrtc-ip-handling-policy',
-    );
-  }
-  if (options.disableWebgl) {
-    args.push(
-      '--disable-webgl',
-      '--disable-webgl-image-chromium',
-      '--disable-webgl2',
-    );
-  }
 
-  // Resolve Chrome channel for Patchright
-  let patchrightChannel: string | undefined;
-  if (!executablePath) {
-    if (channel === 'canary') {
-      patchrightChannel = 'chrome-canary';
-    } else if (channel === 'beta') {
-      patchrightChannel = 'chrome-beta';
-    } else if (channel === 'dev') {
-      patchrightChannel = 'chrome-dev';
-    } else {
-      patchrightChannel = 'chrome';
-    }
-  }
+  // System Chrome stable when not using cloak; cloak provides its own binary.
+  const channel = executablePath ? undefined : 'chrome';
 
-  // Use viewport: null to disable Playwright's viewport emulation.
-  // This exposes real OS window/screen dimensions (no fake 1920x1080).
-  // Note: deviceScaleFactor is incompatible with viewport: null.
-  const hasCustomViewport = !!options.viewport;
+  // viewport: null disables Playwright's viewport emulation, exposing real
+  // OS window/screen dimensions (avoids the 1280x720 fake-viewport bot signal).
   const contextOptions = {
-    viewport: hasCustomViewport ? options.viewport : null,
-    ...(hasCustomViewport ? {
-      screen: {width: options.viewport!.width, height: options.viewport!.height},
-      deviceScaleFactor: 2,
-    } : {}),
-    colorScheme: 'dark' as const,
-    isMobile: false,
-    hasTouch: false,
-    serviceWorkers: 'allow' as const,
-    permissions: ['geolocation', 'notifications'] as string[],
-    ignoreHTTPSErrors: options.acceptInsecureCerts ?? true,
+    viewport: null,
+    ignoreHTTPSErrors: true,
   };
 
   // --isolated mode: launch() + newContext() for clean isolated context.
   // Creates an incognito-like context with no persisted state.
   if (isolated) {
     const browser = await chromium.launch({
-      channel: patchrightChannel,
+      channel,
       executablePath,
-      headless,
+      headless: false,
+      chromiumSandbox: true,
       args,
-      ignoreDefaultArgs: options.noStealth ? undefined : HARMFUL_ARGS,
     });
 
     const context = await browser.newContext(contextOptions);
@@ -178,14 +147,16 @@ export async function launch(options: McpLaunchOptions): Promise<BrowserResult> 
 
   // Default: launchPersistentContext for full state persistence
   // (cookies, IndexedDB, Cache Storage, Service Workers, localStorage).
-  const userDataDir = options.userDataDir ?? DEFAULT_USER_DATA_DIR;
+  // persistentProfileDir is non-undefined here because the isolated branch
+  // returned above; assert via the non-null assertion to satisfy the type.
+  const userDataDir = persistentProfileDir!;
   try {
     const context = await chromium.launchPersistentContext(userDataDir, {
-      channel: patchrightChannel,
+      channel,
       executablePath,
-      headless,
+      headless: false,
+      chromiumSandbox: true,
       args,
-      ignoreDefaultArgs: options.noStealth ? undefined : HARMFUL_ARGS,
       ...contextOptions,
     });
 
@@ -226,5 +197,3 @@ export async function ensureBrowserLaunched(
 
   return browserResult;
 }
-
-export type Channel = 'stable' | 'canary' | 'beta' | 'dev';

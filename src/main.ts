@@ -7,7 +7,6 @@
 import './polyfill.js';
 
 import {ensureBrowserConnected, ensureBrowserLaunched} from './browser.js';
-import type {Channel} from './browser.js';
 import type {BrowserResult} from './browser.js';
 import {parseArguments} from './cli.js';
 import {features} from './features.js';
@@ -59,55 +58,35 @@ server.server.setRequestHandler(SetLevelRequestSchema, () => {
 
 let context: McpContext;
 
-// No JS-level init scripts — Patchright's C++ patches + STEALTH_ARGS handle
-// anti-detection at the browser level. JS patches (Error.prepareStackTrace,
-// screen property overrides, fake chrome.runtime) actually CAUSE detection
-// because anti-bot systems check for Object.defineProperty tampering.
+// No JS-level init scripts — Patchright's protocol-layer stealth handles
+// automation signal suppression. JS patches (Error.prepareStackTrace, screen
+// property overrides, fake chrome.runtime) actually CAUSE detection because
+// anti-bot systems check for Object.defineProperty tampering. Source-level
+// fingerprint patches (canvas/WebGL/GPU) are opt-in via --cloak.
 
 async function getContext(): Promise<McpContext> {
-  const extraArgs: string[] = (args.chromeArg ?? []).map(String);
-  if (args.proxyServer) {
-    extraArgs.push(`--proxy-server=${args.proxyServer}`);
-  }
-  const devtools = args.experimentalDevtools ?? false;
   let result: BrowserResult;
-  if (args.browserUrl || args.wsEndpoint) {
+  if (args.browserUrl) {
     result = await ensureBrowserConnected({
       browserURL: args.browserUrl,
-      wsEndpoint: args.wsEndpoint,
-      wsHeaders: args.wsHeaders,
-      devtools,
     });
   } else {
     result = await ensureBrowserLaunched({
-      headless: args.headless,
-      executablePath: args.executablePath,
-      channel: args.channel as Channel,
       isolated: args.isolated,
       logFile,
-      viewport: args.viewport,
-      args: extraArgs,
-      acceptInsecureCerts: args.acceptInsecureCerts,
-      devtools,
-      hideCanvas: args.hideCanvas,
-      blockWebrtc: args.blockWebrtc,
-      disableWebgl: args.disableWebgl,
-      noStealth: args.noStealth,
+      cloak: args.cloak,
     });
   }
 
   if (!context || context.browserContext !== result.context) {
-    context = await McpContext.from(result.context, logger, {
-      experimentalDevToolsDebugging: devtools,
-      experimentalIncludeAllPages: args.experimentalIncludeAllPages,
-    });
+    context = await McpContext.from(result.context, logger);
   }
   return context;
 }
 
 const logDisclaimers = () => {
   console.error(
-    `chrome-devtools-mcp exposes content of the browser instance to the MCP clients allowing them to inspect,
+    `js-reverse-mcp exposes content of the browser instance to the MCP clients allowing them to inspect,
 debug, and modify any data in the browser or DevTools.
 Avoid sharing sensitive or personal information that you do not want to share with MCP clients.`,
   );
@@ -116,12 +95,6 @@ Avoid sharing sensitive or personal information that you do not want to share wi
 const toolMutex = new Mutex();
 
 function registerTool(tool: ToolDefinition): void {
-  if (
-    tool.annotations.category === ToolCategory.NETWORK &&
-    args.categoryNetwork === false
-  ) {
-    return;
-  }
   server.registerTool(
     tool.name,
     {

@@ -57,7 +57,17 @@ export const newPage = defineTool({
     ...timeoutSchema,
   },
   handler: async (request, response, context) => {
-    const page = await context.newPage();
+    // launchPersistentContext opens an initial about:blank tab on startup.
+    // If a blank tab is still around (either the startup one or an explicitly
+    // requested one), navigate it in place instead of opening another tab —
+    // avoids the "two about:blank" UX on first MCP tool call.
+    const existingBlank = context
+      .getPages()
+      .find(p => p.url() === 'about:blank');
+    const page = existingBlank ?? (await context.newPage());
+    if (existingBlank) {
+      context.selectPage(existingBlank);
+    }
 
     // Use plain goto without waitForEventsAfterAction to avoid creating
     // a CDP session during navigation. Anti-bot systems detect the extra

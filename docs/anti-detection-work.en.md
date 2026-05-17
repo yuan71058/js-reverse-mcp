@@ -1,237 +1,173 @@
-# js-reverse-mcp Anti-Detection Work Log
+# js-reverse-mcp Anti-Detection Architecture
 
-## Background
+English | [中文](anti-detection-work.md)
 
-js-reverse-mcp is a Node.js-based MCP Server that uses Patchright (Node.js) to control Chrome, providing DevTools debugging capabilities to AI coding assistants.
+Anti-detection in js-reverse-mcp is **cleanly layered**. The wrapper layer (this MCP itself) does **zero JS injection and zero `Object.defineProperty` hacks** — those would themselves become detection signals. All real anti-detection work happens in two orthogonal layers: the **protocol layer** (Patchright) and the optional **source layer** (CloakBrowser binary).
 
-During testing, we discovered that visiting Zhihu column `https://zhuanlan.zhihu.com/p/1930714592423703026` was blocked, returning `{"error":{"code":40362,"message":"Your current request is abnormal, temporarily restricting this access"}}`.
-
-Meanwhile, another Python project Scrapling using Patchright (Python) + similar launch arguments could open the same page successfully.
-
-## Root Cause Analysis
-
-### Verification Method: Controlled Variable Testing
-
-We wrote a standalone test script `test_raw_patchright.mjs` using the exact same Patchright Node.js + STEALTH_ARGS as the MCP, but without loading the MCP framework layer. Result: **The standalone script could open Zhihu and Google normally**.
-
-This proved:
-
-- **NOT** a Patchright Node.js vs Python difference
-- **NOT** a browser fingerprint issue (both fingerprints were identical)
-- **The problem was 100% in the MCP framework layer**
-
-### Root Cause 1: CDP Leaks During Navigation (Zhihu Blocking)
-
-The MCP framework executes multiple CDP-related operations before and after `page.goto()` during navigation tool calls:
-
-1. **`detectOpenDevToolsWindows()`** — Iterates all pages, creates CDP sessions for devtools:// pages and calls `Target.getTargetInfo`
-2. **`createPagesSnapshot()`** — Internally calls `detectOpenDevToolsWindows()`
-3. **`waitForEventsAfterAction()`** (fixed) — Creates additional CDP sessions to listen for `Page.frameStartedNavigating`
-
-This CDP activity during page navigation was detected by Zhihu's JS challenge script.
-
-### Root Cause 2: Contaminated Persistent user-data-dir (Zhihu Blocking)
-
-Previous blocking incidents accumulated risk control markers (device IDs and reputation data in Cookie/Cache/LocalStorage). Resolved by clearing `~/.cache/chrome-devtools-mcp/chrome-profile` combined with CDP fixes.
-
-### Root Cause 3: JS Init Script Actually Caused Detection (Google reCAPTCHA)
-
-We wrote `src/stealth-init.ts` attempting to fix the following leaks via JS injection:
-
-- `Error.stack` contains `UtilityScript` → Override `Error.prepareStackTrace`
-- `chrome.runtime` / `chrome.app` missing → Create fake objects
-- `screen.availHeight` equals `screen.height` → `Object.defineProperty` override
-- `Notification.permission` abnormal → Override
-
-**Result: These JS patches backfired and were detected by Google's anti-bot system.**
-
-Anti-bot detection techniques include:
-
-- Checking if `Object.getOwnPropertyDescriptor` returns a getter vs data property (real Chrome's screen properties are data properties, not getters)
-- Checking if function `.toString()` contains `[native code]` (faked functions can't pass)
-- Checking if `Error.prepareStackTrace` has been overridden
-
-**Key Verification:**
-
-1. Standalone script (no init script) → Google search works ✅
-2. MCP + init script → Google triggers "unusual traffic" ❌
-3. MCP without init script → Google search works ✅
-4. All tests above used `launchPersistentContext`, ruling out launch method differences
-
-**Conclusion: Scrapling also doesn't use init scripts, relying entirely on Patchright C++ patches + launch arguments. JS-level anti-detection patches are unreliable.**
-
-## Completed Fixes
-
-### 1. Base Anti-Detection Alignment
-
-Configuration aligned with Scrapling:
-
-| Layer                | Description                                        | Status |
-| -------------------- | -------------------------------------------------- | ------ |
-| Patchright Engine    | Using patchright v1.51.1 / patchright-core v1.58.2 | ✅     |
-| Launch Arguments     | 60+ STEALTH_ARGS, aligned with Scrapling           | ✅     |
-| HARMFUL_ARGS Removal | --enable-automation and 4 other arguments          | ✅     |
-| Context Spoofing     | dark theme, isMobile=false, hasTouch=false         | ✅     |
-| navigator.webdriver  | Patchright C++ patch active, value is false        | ✅     |
-| Bot Detection Test   | sannysoft.com all passed                           | ✅     |
-
-Related files:
-
-- `src/stealth-args.ts` — Launch argument definitions (HARMFUL_ARGS / DEFAULT_ARGS / STEALTH_ARGS)
-- `src/browser.ts` — Browser launch/connect logic
-
-### 2. Google Referer Spoofing
-
-**File:** `src/tools/pages.ts`
-
-Scrapling includes `referer: 'https://www.google.com/'` with every `page.goto()`, simulating clicks from Google search results.
-
-Changes:
-
-- `new_page` tool: `page.goto(url, { referer: 'https://www.google.com/' })`
-- `navigate_page` tool (type=url): Same as above
-
-### 3. Viewport Uses Real Dimensions
-
-**File:** `src/browser.ts`, `src/stealth-args.ts`
-
-- `viewport: null` disables Playwright's viewport emulation, letting the OS manage window size natively
-- Added `--window-size=1920,1080` launch argument
-- `deviceScaleFactor` / `screen` only set when user explicitly specifies `--viewport`
-- Exposes real Mac resolution (1512x982, colorDepth 30, DPR 2)
-
-### 4. Lazy CDP Domain Initialization (Critical Fix)
-
-**File:** `src/McpContext.ts`, `src/main.ts`
-
-A core part of Patchright's anti-detection is **silent CDP**. However, the MCP Server originally enabled multiple CDP domains immediately at startup:
-
-| Collector          | CDP Domain                           | Original Init Timing |
-| ------------------ | ------------------------------------ | -------------------- |
-| DebuggerContext    | `Debugger.enable`                    | McpContext.#init()   |
-| NetworkCollector   | `Network.requestWillBeSent` listener | init() → addPage()   |
-| ConsoleCollector   | `Audits.enable`                      | init() → addPage()   |
-| WebSocketCollector | Network.webSocket\* listener         | init() → addPage()   |
-
-**Fix:**
-
-- `McpContext.#init()` no longer immediately initializes collectors
-- Added `ensureCollectorsInitialized()` method, deferred to first non-navigation tool call
-- In `main.ts`: `ToolCategory.NAVIGATION` category tools don't trigger collector initialization
-- `reinitDebugger()` / `reinitDebuggerForFrame()` skip when collectors are uninitialized
-- `newPage()` doesn't register collectors when uninitialized
-
-### 5. Fully Silent Navigation Tools (Critical Fix)
-
-**File:** `src/tools/pages.ts`, `src/main.ts`, `src/McpContext.ts`
-
-Even after deferring collectors, CDP leaks remained in the navigation tool call chain:
-
-| Leak Point                    | Location                | CDP Behavior                                                       |
-| ----------------------------- | ----------------------- | ------------------------------------------------------------------ |
-| `waitForEventsAfterAction()`  | pages.ts handler        | Creates CDP session + listens for `Page.frameStartedNavigating`    |
-| `detectOpenDevToolsWindows()` | main.ts every tool call | Creates CDP session for devtools:// pages + `Target.getTargetInfo` |
-| `createPagesSnapshot()`       | McpResponse.handle()    | Internally calls `detectOpenDevToolsWindows()`                     |
-
-**Fix:**
-
-- `new_page` / `navigate_page` no longer use `waitForEventsAfterAction()`, directly calls `page.goto()`
-- Navigation tools in `main.ts` skip `detectOpenDevToolsWindows()`
-- `createPagesSnapshot()` skips `detectOpenDevToolsWindows()` when collectors are uninitialized
-
-**Post-fix navigation tool CDP timeline:**
+## Architecture Overview
 
 ```
-1. getContext() — McpContext.#init() only does createPagesSnapshot() (no CDP session)
-2. Skip detectOpenDevToolsWindows() ✅
-3. Skip ensureCollectorsInitialized() ✅
-4. context.newPage() — Pure Playwright API
-5. page.goto() — Pure navigation, no extra CDP
-6. response.handle() → createPagesSnapshot() (doesn't call detectOpenDevToolsWindows) ✅
+┌────────────────────────────────────────────────────────────┐
+│ What the site's JS can see (the surface)                   │
+├────────────────────────────────────────────────────────────┤
+│ Protocol layer: Patchright (always on, both modes)         │
+│  • Does NOT call Runtime.enable / Console.enable (classic  │
+│    CDP leaks)                                              │
+│  • Evaluates in isolated execution context by default      │
+│  • Sanitizes default launch args (strips --enable-automation) │
+│  • Provides Closed Shadow Root access                      │
+├────────────────────────────────────────────────────────────┤
+│ Source layer: CloakBrowser binary (only with --cloak)      │
+│  • 49 C++ patches: navigator.webdriver / canvas / WebGL /  │
+│    audio / fonts / GPU / screen / WebRTC / TLS             │
+│  • Fingerprint derived from a seed, persisted per profile  │
+└────────────────────────────────────────────────────────────┘
+                            ↑
+    Wrapper layer (this MCP) — ZERO stealth responsibility:
+       • Launch / connect Chrome
+       • Silent CDP navigation
+       • Google referer
+       • Real OS viewport
+       • Injects NO JS, hacks NO properties
 ```
 
-**Core principle: Navigate to the target page first and pass bot detection → then activate CDP domains for reverse engineering.**
+## Mode Comparison
 
-### 6. Remove JS Init Script (Critical Fix)
+| Dimension | Default mode | `--cloak` mode |
+|---|---|---|
+| Browser binary | System Google Chrome | CloakBrowser custom Chromium (based on 145) |
+| Protocol-layer stealth | Patchright | Patchright |
+| Source-layer fingerprint patches | None | 49 C++ patches |
+| Profile directory | `~/.cache/chrome-devtools-mcp/chrome-profile` | `~/.cache/chrome-devtools-mcp/cloak-profile` (physically isolated) |
+| Chrome Web Store / Google sync | ✅ | ❌ (Chromium has no Google closed-source services) |
+| Anti-bot bypass rate | Medium | High (passes 30+ detection sites in CloakBrowser's tests) |
 
-**Deleted file:** `src/stealth-init.ts`
+Full comparison and `--cloak` guide: [cloak.en.md](cloak.en.md)
 
-JS-level anti-detection patches were detected by Google's anti-bot system, triggering "unusual traffic" blocking.
+## Wrapper-Layer Navigation-Time Safeguards
 
-Specific patches removed:
+While the bulk of anti-detection lives in Patchright + cloak, the wrapper has a few non-negotiable safeguards around **navigation**:
 
-- `Error.prepareStackTrace` override (filtering UtilityScript)
-- Fake `chrome.runtime` / `chrome.app` objects
-- `Object.defineProperty` override for `screen.availHeight` / `screen.availTop`
-- `Object.defineProperty` override for `window.outerHeight` / `window.outerWidth`
-- `Notification.permission` override
-- `navigator.connection` property override
+### 1. Silent CDP navigation
 
-Also removed the `--initScript` CLI argument.
+During page load, **no CDP domains are activated**. `Network.enable` / `Debugger.enable` / `Audits.enable` are all deferred until the first **non-navigation** tool call.
 
-**Lesson: Don't do anti-detection patches at the JS level. Let Patchright C++ patches + launch arguments handle everything.**
+**Why this matters**: anti-bot scripts (Zhihu's 40362, Cloudflare challenges, reCAPTCHA, etc.) **actively probe CDP traffic** during page load. Seeing a `Network.requestWillBeSent` subscription is an instant bot verdict. Deferring initialization = let the risk-control JS run, get through, then open the debugging channel.
 
-### 7. Notification Permission Fix
+Relevant code:
+- `src/McpContext.ts:ensureCollectorsInitialized()` — deferred init entry point
+- `src/main.ts` — special-cases `ToolCategory.NAVIGATION` tools, skipping collector init
 
-**File:** `src/browser.ts`
+### 2. Google referer
 
-Added `'notifications'` to the permissions array, changing `Notification.permission` from `"denied"` to `"granted"`.
+The `new_page` tool defaults to `referer: https://www.google.com/`. This mimics the most common "clicked through from Google Search" inbound path, reducing the suspicion score that some sites apply to direct visits.
 
-## Current Status
+Relevant code: `src/tools/pages.ts:46` (`DEFAULT_REFERER`).
 
-**Zhihu ✅ Passed** — Page loads normally, no 40362 error.
+### 3. Real OS viewport
 
-**Google ✅ Passed** — Homepage loads normally, manual search returns results normally, no reCAPTCHA.
+`viewport: null` disables Playwright's default 1280×720 fake viewport — the browser reports the **real screen dimensions**. The fake viewport itself is a bot signal.
 
-## Known Remaining Leaks
+Relevant code: `src/browser.ts`, in `contextOptions = { viewport: null, ... }`.
 
-These leaks also exist in Scrapling (Python Patchright) and don't affect passing mainstream anti-bot detection:
+### 4. Headed-only
 
-| Detection Item                         | Current Value | Expected Value          | Notes                                                           |
-| -------------------------------------- | ------------- | ----------------------- | --------------------------------------------------------------- |
-| `Error.stack` contains `UtilityScript` | Present       | Should not exist        | Patchright execution context leak, only visible during evaluate |
-| `chrome.runtime`                       | Missing       | Should have full object | Patchright C++ layer doesn't fully emulate                      |
-| `chrome.app`                           | Missing       | Should have full object | Same as above                                                   |
+`headless: false` is hardcoded. This MCP is a **visual debugging tool for human analysts**, not a headless scraper. Headless mode remains detectable by various means even with cloak patches, so the `--headless` flag is intentionally never exposed.
 
-**Note: Do not attempt to fix these leaks with JS init scripts — it will backfire.**
+### 5. `--test-type` banner suppression
 
-## Usage Notes
+The wrapper hard-injects `--test-type` — **not for stealth, as a UX flag**. It tells Chrome to shut up: otherwise every "dev-only" flag Patchright/cloak injects produces a yellow "unsupported command-line flag" banner at the top of every tab.
 
-### Request Capture on Anti-Detection Sites
+Relevant code: `src/browser.ts:113`.
 
-To pass bot detection, navigation tools (`new_page`, `navigate_page`) don't activate CDP collectors (Network/Console/WebSocket/Debugger) during execution. This means requests, console messages, WebSocket connections, and JS script lists during initial page load will not be captured.
+### 6. Physically isolated profile dirs
 
-**Recommended workflow: Navigate first, then reload**
+`--cloak` and default mode **never share a profile directory**. Cross-version state (cache, extensions, shader cache) between different Chromium builds triggers `Network.setCacheDisabled` internal errors that crash launch outright.
 
-1. Use `new_page` or `navigate_page` to navigate to the target page (passes bot detection but doesn't capture requests)
-2. Call any non-navigation tool (e.g. `evaluate_script`, `list_network_requests`) to trigger CDP collector initialization
-3. Use `navigate_page` with `reload` to refresh the page
-4. Now all requests, console messages, scripts, etc. will be fully captured
+Relevant code: `src/browser.ts:36-37` (`DEFAULT_USER_DATA_DIR` / `DEFAULT_CLOAK_DATA_DIR`).
+
+## Design Principles (Do Not Violate)
+
+These principles came from real burns. **Read them before changing code.**
+
+### Principle 1: NEVER do JS-level anti-detection
+
+The wrapper layer must **never** use `addInitScript` or `Object.defineProperty` to modify `navigator.*` / `screen.*` / `chrome.*` properties. Such hacks:
+
+- Leave detectable getter/setter traces via `Object.getOwnPropertyDescriptor` (real Chrome has these as data properties, not accessors)
+- Cause `Error.stack` to contain `UtilityScript` / `eval at ...` markers
+- Make the hacked function's `.toString()` no longer return `[native code]`
+
+Strong anti-bot systems (Google reCAPTCHA, FingerprintJS, etc.) **specifically check for these traces**. **JS patches backfire and trigger "unusual traffic" blocks**.
+
+**Real anti-detection happens in two places only**: C++ binary layer (cloak) + CDP protocol layer (Patchright).
+
+The project once had `src/stealth-init.ts` trying to patch `chrome.runtime` / `screen.availHeight` / similar "leftover leaks". It got detected by Google. **Deleted. Do not reintroduce.**
+
+### Principle 2: NEVER do config-level fingerprint hacks
+
+Launch args like `--lang=en-US`, `--window-size=1920,1080`, `--fingerprinting-canvas-image-data-noise` are also stealth anti-patterns:
+
+- Attempt to fake a real browser via flags
+- Break with every Chrome update
+- The flag combination itself becomes a fingerprint
+
+The right approach: use **real OS defaults** (`viewport: null`), or use cloak binary's **source-layer patches** (`--fingerprint=<seed>` lets the binary derive a consistent fingerprint internally).
+
+The project once had a 137-line `STEALTH_ARGS` going down this path. **Deleted. Do not reintroduce.**
+
+### Principle 3: CDP must be deferred
+
+See "Wrapper-Layer Navigation-Time Safeguards §1". Any code that triggers `Network.enable` / `Debugger.enable` / `Audits.enable` during navigation defeats anti-detection.
+
+### Principle 4: Distinguish "stealth deletion" from "UX deletion"
+
+When cleaning up stealth code, **classify by runtime behavior, not by filename**. For example, `--test-type` was historically lumped with stealth flags, but its actual runtime role is **UX (banner suppression)**, not stealth. Lumping them together led to deleting `--test-type` and immediately getting yellow banners on every page.
+
+Test before deleting: "What does this flag actually do at runtime? Would removing it produce an immediate visible change for the user?"
+
+### Principle 5: Headed-only
+
+`headless: false` is hardcoded; the `--headless` flag is **not exposed**. Reasoning:
+
+- The user's mental model is "see the browser to debug"
+- Headless still has detection vectors that fingerprint patches don't cover
+- Exposing a `--headless` flag is a trap for users
+
+## Known Residual Leaks
+
+These leaks also exist in Patchright, Scrapling, and similar tools. **They do not break mainstream anti-bot tests**:
+
+| Detection | Current value | Expected | Notes |
+|---|---|---|---|
+| `chrome.runtime` | `undefined` | Should be a full object | Chrome hides this when controlled via CDP; cloak binary doesn't patch it either |
+| `chrome.app` | `undefined` | Same as above | Same |
+| `Error.stack` from `evaluate()` | contains isolated-context markers | Should be a normal stack | Patchright's isolated world marker, only visible in evaluate call stacks |
+
+**Do not try to patch these at the JS level** — see Principle 1.
+
+## CDP-Aware Debugging Workflow
+
+Because navigation tools intentionally keep CDP silent, **requests, console messages, WebSocket connections, and JS script lists are not collected during initial page load**. This is by design — pass risk controls first, then open the debugging channel.
+
+Recommended workflow (**navigate first, then reload**):
 
 ```
-# Step 1: Navigate to target page (silent mode, passes bot detection)
+# 1. Navigate to target (silent, passes risk controls)
 new_page(url="https://example.com")
 
-# Step 2: Any non-navigation tool call triggers collector initialization
-list_network_requests()  # Returns empty, but collectors are now started
+# 2. Any non-navigation tool call — triggers CDP collector activation
+list_network_requests()   # returns empty here, but collectors are now active
 
-# Step 3: Reload the page to fully capture all requests
+# 3. Reload to capture everything
 navigate_page(type="reload")
 
-# Step 4: Now you can see the complete request list
-list_network_requests()  # Returns all requests
+# 4. Now you see the full request list
+list_network_requests()
 ```
 
-## File Change List
+## Further Reading
 
-| File                      | Change Type | Description                                                                                          |
-| ------------------------- | ----------- | ---------------------------------------------------------------------------------------------------- |
-| `src/tools/pages.ts`      | Modified    | Added Google Referer; removed waitForEventsAfterAction                                               |
-| `src/browser.ts`          | Modified    | viewport: null + conditional DPR; added notifications permission                                     |
-| `src/stealth-args.ts`     | Modified    | Added --window-size=1920,1080                                                                        |
-| `src/McpContext.ts`       | Modified    | Lazy CDP collector initialization; createPagesSnapshot conditionally skips detectOpenDevToolsWindows |
-| `src/main.ts`             | Modified    | Navigation tools fully skip CDP operations; removed init script logic                                |
-| `src/stealth-init.ts`     | **Deleted** | JS init script caused Google detection, removed                                                      |
-| `src/cli.ts`              | Modified    | Removed --initScript CLI argument                                                                    |
-| `test_raw_patchright.mjs` | Added       | Standalone test script, verified raw Patchright passes Zhihu                                         |
-| `test_zhihu_search.mjs`   | Added       | Google search test script, verified no init script passes Google                                     |
+- Full `--cloak` guide, profile/fingerprint identity binding, dual-MCP setup: [cloak.en.md](cloak.en.md)
+- CloakBrowser project (49 C++ patches explained): https://github.com/CloakHQ/CloakBrowser
+- How Patchright's protocol-layer stealth works: https://github.com/Kaliiiiiiiiii-Vinyzu/patchright-nodejs

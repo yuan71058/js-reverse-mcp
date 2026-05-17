@@ -1,239 +1,172 @@
-# js-reverse-mcp 反检测工作记录
+# js-reverse-mcp 反检测分层架构
 
 [English](anti-detection-work.en.md) | 中文
 
-## 背景
+js-reverse-mcp 的反检测**分层清晰**：包装层（这个 MCP 本身）**零 JS 注入、零 `Object.defineProperty` hack**（这些反而会成为检测信号）。所有真正的反检测能力都集中在两层互相正交的处理上：**协议层**（Patchright）+ 可选的**源码层**（CloakBrowser 二进制）。
 
-js-reverse-mcp 是一个基于 Node.js 的 MCP Server，使用 Patchright (Node.js) 控制 Chrome 浏览器，为 AI 编码助手提供 DevTools 调试能力。
-
-在测试中发现，访问知乎专栏 `https://zhuanlan.zhihu.com/p/1930714592423703026` 时被拦截，返回 `{"error":{"code":40362,"message":"您当前请求存在异常，暂时限制本次访问"}}`。
-
-而另一个 Python 项目 Scrapling 使用 Patchright (Python) + 相似的启动参数配置，可以正常打开同一页面。
-
-## 根因定位
-
-### 验证方法：控制变量法
-
-编写了独立测试脚本 `test_raw_patchright.mjs`，使用与 MCP 完全相同的 Patchright Node.js + STEALTH_ARGS，但不加载 MCP 框架层。结果：**独立脚本可以正常打开知乎和 Google**。
-
-这证明：
-
-- **不是** Patchright Node.js vs Python 的差异
-- **不是** 浏览器指纹问题（两者指纹完全一致）
-- **问题 100% 出在 MCP 框架层**
-
-### 根因 1：导航期间的 CDP 泄露（知乎拦截）
-
-MCP 框架在导航工具调用时，会在 `page.goto()` 前后执行多个涉及 CDP 的操作：
-
-1. **`detectOpenDevToolsWindows()`** — 遍历所有页面，对 devtools:// 页面创建 CDP session 并调用 `Target.getTargetInfo`
-2. **`createPagesSnapshot()`** — 内部调用 `detectOpenDevToolsWindows()`
-3. **`waitForEventsAfterAction()`**（已修复） — 创建额外 CDP session 监听 `Page.frameStartedNavigating`
-
-这些 CDP 活动在页面导航过程中被知乎的 JS 质询脚本检测到。
-
-### 根因 2：持久化 user-data-dir 被污染（知乎拦截）
-
-之前多次被拦截的记录积累了风控标记（Cookie/Cache/LocalStorage 中的设备 ID 和信誉数据）。清除 `~/.cache/chrome-devtools-mcp/chrome-profile` 后配合 CDP 修复解决。
-
-### 根因 3：JS init script 反而导致检测（Google reCAPTCHA）
-
-编写了 `src/stealth-init.ts` 试图通过 JS 注入修复以下泄露：
-
-- `Error.stack` 含 `UtilityScript` → 覆盖 `Error.prepareStackTrace`
-- `chrome.runtime` / `chrome.app` 缺失 → 伪造对象
-- `screen.availHeight` 等于 `screen.height` → `Object.defineProperty` 覆盖
-- `Notification.permission` 异常 → 覆盖
-
-**结果：这些 JS patch 弄巧成拙，被 Google 的反爬系统检测到了。**
-
-反爬系统的检测手段包括：
-
-- 检查 `Object.getOwnPropertyDescriptor` 返回的是 getter 还是 data property（真实 Chrome 的 screen 属性是 data property，不是 getter）
-- 检查函数的 `.toString()` 是否包含 `[native code]`（伪造的函数无法通过）
-- 检查 `Error.prepareStackTrace` 是否被覆盖
-
-**关键验证**：
-
-1. 独立脚本（无 init script）→ Google 搜索正常 ✅
-2. MCP + init script → Google 触发 "unusual traffic" ❌
-3. MCP 删除 init script → Google 搜索正常 ✅
-4. 上述测试均使用 `launchPersistentContext`，排除了启动方式的影响
-
-**结论：Scrapling 也不使用 init script，完全依赖 Patchright C++ patch + 启动参数。JS 层面的反检测 patch 不可靠。**
-
-## 已完成的修复
-
-### 1. 基础反检测对齐
-
-与 Scrapling 对齐的基础配置：
-
-| 层级                | 说明                                              | 状态 |
-| ------------------- | ------------------------------------------------- | ---- |
-| Patchright 引擎     | 使用 patchright v1.51.1 / patchright-core v1.58.2 | ✅   |
-| 启动参数            | 60+ STEALTH_ARGS，与 Scrapling 一致               | ✅   |
-| HARMFUL_ARGS 移除   | --enable-automation 等 5 个参数                   | ✅   |
-| 上下文伪装          | dark 主题、isMobile=false、hasTouch=false         | ✅   |
-| navigator.webdriver | Patchright C++ patch 生效，值为 false             | ✅   |
-| bot 检测站测试      | sannysoft.com 全部 passed                         | ✅   |
-
-相关文件：
-
-- `src/stealth-args.ts` — 启动参数定义（HARMFUL_ARGS / DEFAULT_ARGS / STEALTH_ARGS）
-- `src/browser.ts` — 浏览器启动/连接逻辑
-
-### 2. Google Referer 伪装
-
-**文件：** `src/tools/pages.ts`
-
-Scrapling 每次 `page.goto()` 都带 `referer: 'https://www.google.com/'`，模拟从 Google 搜索点击进入。
-
-修改内容：
-
-- `new_page` 工具：`page.goto(url, { referer: 'https://www.google.com/' })`
-- `navigate_page` 工具（type=url）：同上
-
-### 3. viewport 使用真实尺寸
-
-**文件：** `src/browser.ts`, `src/stealth-args.ts`
-
-- `viewport: null` 禁用 Playwright 的 viewport 模拟，让 OS 原生管理窗口大小
-- 添加 `--window-size=1920,1080` 启动参数
-- `deviceScaleFactor` / `screen` 仅在用户显式指定 `--viewport` 时设置
-- 暴露真实 Mac 分辨率（1512x982、colorDepth 30、DPR 2）
-
-### 4. CDP 域延迟初始化（关键修复）
-
-**文件：** `src/McpContext.ts`, `src/main.ts`
-
-Patchright 的防检测核心之一是**静默 CDP**。但 MCP Server 原来在启动时立即启用了多个 CDP 域：
-
-| Collector          | CDP 域                           | 原来的初始化时机   |
-| ------------------ | -------------------------------- | ------------------ |
-| DebuggerContext    | `Debugger.enable`                | McpContext.#init() |
-| NetworkCollector   | `Network.requestWillBeSent` 监听 | init() → addPage() |
-| ConsoleCollector   | `Audits.enable`                  | init() → addPage() |
-| WebSocketCollector | Network.webSocket\* 监听         | init() → addPage() |
-
-**修复：**
-
-- `McpContext.#init()` 不再立即初始化 collectors
-- 新增 `ensureCollectorsInitialized()` 方法，延迟到首次非导航工具调用时执行
-- `main.ts` 中：`ToolCategory.NAVIGATION` 类别工具不触发 collectors 初始化
-- `reinitDebugger()` / `reinitDebuggerForFrame()` 在 collectors 未初始化时跳过
-- `newPage()` 在 collectors 未初始化时不注册收集器
-
-### 5. 导航工具完全静默化（关键修复）
-
-**文件：** `src/tools/pages.ts`, `src/main.ts`, `src/McpContext.ts`
-
-发现即使延迟了 collectors，导航工具调用链中仍有 CDP 泄露：
-
-| 泄露点                        | 位置                 | CDP 行为                                                     |
-| ----------------------------- | -------------------- | ------------------------------------------------------------ |
-| `waitForEventsAfterAction()`  | pages.ts handler     | 创建 CDP session + 监听 `Page.frameStartedNavigating`        |
-| `detectOpenDevToolsWindows()` | main.ts 每次工具调用 | 对 devtools:// 页面创建 CDP session + `Target.getTargetInfo` |
-| `createPagesSnapshot()`       | McpResponse.handle() | 内部调用 `detectOpenDevToolsWindows()`                       |
-
-**修复：**
-
-- `new_page` / `navigate_page` 不再使用 `waitForEventsAfterAction()`，直接 `page.goto()`
-- `main.ts` 中导航工具跳过 `detectOpenDevToolsWindows()`
-- `createPagesSnapshot()` 在 collectors 未初始化时跳过 `detectOpenDevToolsWindows()`
-
-**修复后导航工具的 CDP 时间线：**
+## 架构总览
 
 ```
-1. getContext() — McpContext.#init() 只做 createPagesSnapshot()（无 CDP session）
-2. 跳过 detectOpenDevToolsWindows() ✅
-3. 跳过 ensureCollectorsInitialized() ✅
-4. context.newPage() — 纯 Playwright API
-5. page.goto() — 纯导航，无额外 CDP
-6. response.handle() → createPagesSnapshot()（不调用 detectOpenDevToolsWindows） ✅
+┌────────────────────────────────────────────────────────────┐
+│ 站点 JS 能看到的表面                                       │
+├────────────────────────────────────────────────────────────┤
+│ 协议层：Patchright（默认 + --cloak 都启用）                │
+│  • 不调用 Runtime.enable / Console.enable（CDP 经典泄露点） │
+│  • Evaluate 默认走 isolated execution context              │
+│  • Default launch args 净化（移除 --enable-automation 等）  │
+│  • 提供 Closed Shadow Root 访问能力                         │
+├────────────────────────────────────────────────────────────┤
+│ 源码层：CloakBrowser 二进制（仅 --cloak 模式）              │
+│  • 49 个 C++ patch：navigator.webdriver / canvas / WebGL / │
+│    audio / fonts / GPU / 屏幕 / WebRTC / TLS               │
+│  • 指纹由 fingerprint seed 派生，按 profile 持久化         │
+└────────────────────────────────────────────────────────────┘
+                            ↑
+        包装层（这个 MCP）—— 零 stealth 责任，只做 plumbing：
+          • 启动/连接 Chrome
+          • CDP 静默导航
+          • Google referer
+          • 真实 OS 视口
+          • 不注入任何 JS、不 hack 任何属性
 ```
 
-**核心原则：先导航到目标页、通过风控 → 然后再激活 CDP 域进行逆向调试。**
+## 模式对比
 
-### 6. 删除 JS init script（关键修复）
+| 维度 | 默认模式 | `--cloak` 模式 |
+|---|---|---|
+| 浏览器二进制 | 系统 Google Chrome | CloakBrowser 定制 Chromium（基于 145） |
+| 协议层 stealth | Patchright | Patchright |
+| 源码层 fingerprint patch | 无 | 49 个 C++ patch |
+| Profile 目录 | `~/.cache/chrome-devtools-mcp/chrome-profile` | `~/.cache/chrome-devtools-mcp/cloak-profile`（物理隔离） |
+| Chrome Web Store / Google sync | ✅ | ❌（Chromium 不含 Google 闭源服务） |
+| 反爬通过率 | 中等 | 高（30+ 站点测试通过） |
 
-**删除文件：** `src/stealth-init.ts`
+详细对比和 `--cloak` 启用指南：[cloak.md](cloak.md)
 
-JS 层面的反检测 patch 被 Google 反爬系统检测到，导致触发 "unusual traffic" 拦截。
+## 包装层的导航级安全措施
 
-具体删除的 patch：
+虽然反检测主体在 Patchright + cloak 这两层，包装层在**导航**这件事上有几个不可缺的辅助措施：
 
-- `Error.prepareStackTrace` 覆盖（过滤 UtilityScript）
-- 伪造 `chrome.runtime` / `chrome.app` 对象
-- `Object.defineProperty` 覆盖 `screen.availHeight` / `screen.availTop`
-- `Object.defineProperty` 覆盖 `window.outerHeight` / `window.outerWidth`
-- `Notification.permission` 覆盖
-- `navigator.connection` 属性覆盖
+### 1. CDP 静默导航
 
-同时删除了 `--initScript` CLI 参数。
+页面加载期间**不激活任何 CDP 域**。`Network.enable` / `Debugger.enable` / `Audits.enable` 全部延后到首个**非导航**工具调用时才激活。
 
-**教训：不要在 JS 层面做反检测 patch，让 Patchright C++ patch + 启动参数处理一切。**
+**为什么这是关键**：anti-bot 脚本（知乎的 40362、Cloudflare 的挑战、reCAPTCHA 等）在页面加载阶段会**实时探测 CDP 流量**。看到 `Network.requestWillBeSent` 这类事件订阅就直接判定为机器人。延后初始化 = 让风控 JS 跑完、放过你，然后再开调试通道。
 
-### 7. Notification 权限修复
+涉及代码：
+- `src/McpContext.ts:ensureCollectorsInitialized()` —— 延迟初始化入口
+- `src/main.ts` —— 对 `ToolCategory.NAVIGATION` 工具特判，跳过 collectors 初始化
 
-**文件：** `src/browser.ts`
+### 2. Google Referer
 
-添加 `'notifications'` 到 permissions 数组，使 `Notification.permission` 从 `"denied"` 变为 `"granted"`。
+`new_page` 工具默认带 `referer: https://www.google.com/`。模拟"从 Google 搜索点进来"的最常见入站路径，降低站点对"直接访问"的可疑度评分。
 
-## 当前状态
+涉及代码：`src/tools/pages.ts:46` 的 `DEFAULT_REFERER`。
 
-**知乎 ✅ 已通过** — 页面正常加载，无 40362 错误。
+### 3. 真实 OS 视口
 
-**Google ✅ 已通过** — 首页正常加载，手动搜索正常返回结果，无 reCAPTCHA。
+`viewport: null` 关闭 Playwright 默认的 1280×720 假视口，让浏览器报告**真实屏幕尺寸**。假视口本身是 bot 信号。
+
+涉及代码：`src/browser.ts` 里 `contextOptions = { viewport: null, ... }`。
+
+### 4. Headed-only
+
+`headless: false` 写死。这个 MCP 是**给人类分析师用的视觉调试工具**，不是无头爬虫。headless 即使叠加了 cloak 也容易被检测，因此根本不暴露 `--headless` flag。
+
+### 5. `--test-type` Banner 抑制
+
+包装层硬塞了 `--test-type` —— **不是 stealth，是 UX flag**。它让 Chrome 闭嘴：否则每个 Patchright / cloak 注入的"dev-only"标记都会在窗口顶端弹出「未受支持命令行标记」黄条。
+
+涉及代码：`src/browser.ts:113`。
+
+### 6. 物理隔离 profile 目录
+
+`--cloak` 和默认模式**绝不共用 profile 目录**。不同 Chromium 版本的 cache / extension / shader state 混在一起会触发 `Network.setCacheDisabled` 内部错误，启动直接挂掉。
+
+涉及代码：`src/browser.ts:36-37` 的 `DEFAULT_USER_DATA_DIR` / `DEFAULT_CLOAK_DATA_DIR`。
+
+## 关键设计原则（不要违反）
+
+这些原则是踩过坑总结出来的，**改代码前请仔细看一遍**。
+
+### 原则 1：绝不做 JS-level 反检测
+
+包装层**绝不**通过 `addInitScript` 或 `Object.defineProperty` 去修改 `navigator.*` / `screen.*` / `chrome.*` 等属性。这种 hack：
+
+- 在 `Object.getOwnPropertyDescriptor` 里能看到 getter/setter 痕迹（真实 Chrome 这些属性都是 data property）
+- 让 `Error.stack` 出现 `UtilityScript` / `eval at ...` 字样
+- 被 hack 的函数 `.toString()` 不再是 `[native code]`
+
+Google reCAPTCHA、FingerprintJS 等高强度反爬会**精确检查这些痕迹**。**JS patch 弄巧成拙，反而触发 "unusual traffic" 拦截**。
+
+**反检测的真实工作只发生在两层**：C++ binary 层（cloak）+ CDP 协议层（Patchright）。
+
+历史上项目曾有 `src/stealth-init.ts` 试图修复 `chrome.runtime` / `screen.availHeight` 等"残留泄露"，结果被 Google 直接检测出来。**已删除，不要重新引入。**
+
+### 原则 2：绝不做 config-level fingerprint hack
+
+类似 `--lang=en-US`、`--window-size=1920,1080`、`--fingerprinting-canvas-image-data-noise` 这类启动参数也是 stealth 反模式：
+
+- 试图通过 flag 假装真实浏览器
+- Chrome 升级一两个版本就失效
+- flag 组合本身可能成为指纹
+
+正确做法：用**真实 OS 默认值**（`viewport: null`），或者用 cloak binary 的**源码层 patch**（`--fingerprint=<seed>` 让二进制内部派生一致的指纹）。
+
+历史上项目曾有 137 行 `STEALTH_ARGS` 走这条路，**已删除，不要重新引入。**
+
+### 原则 3：CDP 一定要延迟初始化
+
+如「包装层的导航级安全措施 §1」所述。任何在导航期间触发 `Network.enable` / `Debugger.enable` / `Audits.enable` 的代码都会破坏反检测。
+
+### 原则 4：分清「stealth 删除」和「UX 删除」
+
+清理 stealth 代码时**要按运行时行为分类、而不是按文件名分类**。例如 `--test-type` 历史上和 stealth 写在一起，但它的真实角色是 **UX flag**（banner 抑制器），不能跟其它 stealth 一起删。
+
+判断方法：删除前问一句「这个 flag 在 runtime 里实际做什么？删了用户会立刻看到什么变化？」
+
+### 原则 5：UA `Headed-only`
+
+`headless: false` 硬编码，**不暴露 `--headless` flag**。理由：
+
+- 用户场景就是看着浏览器调试
+- headless 在多数 anti-bot 系统里仍然有别的检测手段（即使 navigator.webdriver 修了）
+- 暴露 flag 等于给用户挖坑
 
 ## 已知残留泄露点
 
-这些泄露在 Scrapling（Python Patchright）中也同样存在，不影响通过主流反爬检测：
+这些泄露在 Patchright、Scrapling 等同类工具中**也同样存在**，不影响通过主流反爬检测：
 
-| 检测项                           | 当前值 | 期望值       | 说明                                            |
-| -------------------------------- | ------ | ------------ | ----------------------------------------------- |
-| `Error.stack` 含 `UtilityScript` | 存在   | 不应出现     | Patchright 执行上下文泄露，仅在 evaluate 时可见 |
-| `chrome.runtime`                 | 缺失   | 应有完整对象 | Patchright C++ 层未完全模拟                     |
-| `chrome.app`                     | 缺失   | 应有完整对象 | 同上                                            |
+| 检测项 | 当前值 | 期望值 | 说明 |
+|---|---|---|---|
+| `chrome.runtime` | `undefined` | 应有完整对象 | Chrome 在被 CDP 控制时自动隐藏；cloak binary 也未补 |
+| `chrome.app` | `undefined` | 应有完整对象 | 同上 |
+| `Error.stack` 在 `evaluate()` 调用栈里 | 含 isolated context 标记 | 应是普通栈 | Patchright 隔离世界标记，仅在 evaluate 时可见 |
 
-**注意：不要尝试用 JS init script 修复这些泄露，会适得其反。**
+**不要尝试在 JS 层面修复这些** —— 见原则 1。
 
-## 使用注意事项
+## CDP-aware 调试工作流
 
-### 反检测站点的请求捕获
+因为导航工具刻意静默 CDP，**页面加载期间的请求、console、WebSocket、JS 脚本列表不会被收集**。这是设计如此 —— 先过风控、再开调试通道。
 
-为了通过反爬检测，导航工具（`new_page`、`navigate_page`）在执行时不会激活 CDP 收集器（Network/Console/WebSocket/Debugger）。这意味着页面初始加载期间的请求、console 消息、WebSocket 连接和 JS 脚本列表不会被捕获。
-
-**推荐工作流：先导航，再刷新**
-
-1. 使用 `new_page` 或 `navigate_page` 导航到目标页（此时通过风控，但不捕获请求）
-2. 调用任意非导航工具（如 `evaluate_script`、`list_network_requests`）触发 CDP 收集器初始化
-3. 使用 `navigate_page` 的 `reload` 功能刷新页面
-4. 此时所有请求、console 消息、脚本等都会被完整捕获
+推荐工作流（**先导航再刷新**）：
 
 ```
-# Step 1: 导航到目标页（静默模式，通过风控）
+# 1. 导航到目标页（静默，过风控）
 new_page(url="https://example.com")
 
-# Step 2: 任意非导航工具调用，触发 collectors 初始化
-list_network_requests()  # 返回为空，但 collectors 已启动
+# 2. 任意非导航工具调用，触发 CDP collectors 激活
+list_network_requests()   # 此时返回空，但 collectors 已启动
 
-# Step 3: 刷新页面，完整捕获所有请求
+# 3. 刷新页面，完整捕获
 navigate_page(type="reload")
 
-# Step 4: 现在可以看到完整的请求列表
-list_network_requests()  # 返回所有请求
+# 4. 现在可以看到完整的请求列表
+list_network_requests()
 ```
 
-## 文件变更清单
+## 进一步阅读
 
-| 文件                      | 修改类型   | 说明                                                                               |
-| ------------------------- | ---------- | ---------------------------------------------------------------------------------- |
-| `src/tools/pages.ts`      | 修改       | 添加 Google Referer；移除 waitForEventsAfterAction                                 |
-| `src/browser.ts`          | 修改       | viewport: null + 条件性 DPR；添加 notifications 权限                               |
-| `src/stealth-args.ts`     | 修改       | 添加 --window-size=1920,1080                                                       |
-| `src/McpContext.ts`       | 修改       | 延迟 CDP collectors 初始化；createPagesSnapshot 条件跳过 detectOpenDevToolsWindows |
-| `src/main.ts`             | 修改       | 导航工具完全跳过 CDP 相关操作；删除 init script 相关逻辑                           |
-| `src/stealth-init.ts`     | **已删除** | JS init script 导致 Google 检测，已移除                                            |
-| `src/cli.ts`              | 修改       | 移除 --initScript CLI 参数                                                         |
-| `test_raw_patchright.mjs` | 新增       | 独立测试脚本，验证原始 Patchright 可过知乎                                         |
-| `test_zhihu_search.mjs`   | 新增       | Google 搜索测试脚本，验证无 init script 可过 Google                                |
+- `--cloak` 完整指南、Profile 与指纹身份、双 MCP 实例配置：[cloak.md](cloak.md)
+- CloakBrowser 项目（49 个 C++ patch 详解）：https://github.com/CloakHQ/CloakBrowser
+- Patchright 协议层 stealth 工作原理：https://github.com/Kaliiiiiiiiii-Vinyzu/patchright-nodejs

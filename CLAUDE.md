@@ -99,6 +99,37 @@ Tests use Node.js built-in test runner. Test files mirror source structure under
 - `tests/server.ts`: Test utilities for MCP server testing
 - `tests/utils.ts`: Shared test helpers
 
+## Development Philosophy
+
+**第一性原理 — the simplest strategy that achieves the goal.** This is the first element of software development in this project. Before adding or retaining any code, ask:
+
+1. **Does it actually do something?** Verify against the upstream library source. Don't keep "safety net" code that's a no-op. (Example: a 137-line `stealth-args.ts` was deleted in 2026-05 after auditing Patchright's `chromiumSwitches.js` revealed almost every flag in it was either duplicated by Patchright's own defaults or never added by Patchright at all.)
+2. **Is it the minimum needed?** Reject "filter / merge / partial retention" of legacy patterns. When old code and new architecture belong to different paradigms, pick the architecturally correct path and delete the other completely.
+3. **Is it a backward-compat shim?** Don't add `--legacyX` flags or deprecation paths unless explicitly asked. A clean cut is preferred.
+
+Stealth/anti-detection in this project is layered cleanly:
+- **Protocol layer** → Patchright (CDP automation signal suppression, zero JS injection)
+- **Source layer** → CloakBrowser binary (optional, via `--cloak`; 49–57 C++ fingerprint patches)
+- **Wrapper layer (this MCP)** → zero stealth responsibility
+
+Do **not** reintroduce config-level fingerprint flags (`--disable-blink-features=AutomationControlled`, canvas noise hacks, `--lang=en-US` spoofing, etc.) — they belong to the deprecated `playwright-stealth` paradigm and conflict with the layers above.
+
+### Product scope: reverse-engineering tool, not an automation framework
+
+The user of this MCP is a human analyst who **sees** the browser and uses it as a live debugger. They are not impersonating an end user, not scraping at scale, not running cron jobs. Several "automation features" that look superficially relevant are **out of scope and must not be added**:
+
+| Anti-feature | Why it does not belong |
+|---|---|
+| Headless mode | Analyst needs to see the page. `headless: false` is hardcoded; do not reintroduce a `--headless` flag |
+| Humanize (mouse Bézier / keyboard timing / scroll curves) | Analyst is not a "user" being simulated; humanize would slow down every tool call |
+| Proxy server flag (`--proxy-server` passthrough) | System-level proxies (Clash / Surge / mitmproxy / VPN) cover this. Browser-level proxy without GeoIP/timezone alignment is a half-measure that leaks bot signals |
+| GeoIP timezone/locale auto-resolution | Requires `mmdb-lib` + 70MB GeoLite2 DB; only matters for "scrape from another country" scenarios that aren't ours |
+| WebRTC IP spoofing (`--fingerprint-webrtc-ip`) | Only relevant when proxying; we don't proxy |
+| Auto-granted permissions (`geolocation`, `notifications`) | Real users see a prompt; silent grant is itself a bot signal |
+| Hardcoded `colorScheme` / `deviceScaleFactor` / `isMobile` / `hasTouch` | Static fingerprint assumptions in the wrapper layer — pick a value and every user looks the same way. Let Playwright defaults or the real OS reflect through |
+
+The wrapper layer's job is **plumbing only**: connect/launch Chrome, thread CLI flags through, expose the `BrowserContext` to MCP tools. Anything that "decides" what the browser should pretend to be belongs in the binary (`--cloak`) or not at all.
+
 ## Conventions
 
 - Follow [conventional commits](https://www.conventionalcommits.org/) for PR and commit titles

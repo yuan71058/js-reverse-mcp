@@ -33,13 +33,6 @@ import {WaitForHelper} from './WaitForHelper.js';
 import type {WebSocketData} from './WebSocketCollector.js';
 import {WebSocketCollector} from './WebSocketCollector.js';
 
-interface McpContextOptions {
-  // Whether the DevTools windows are exposed as pages for debugging of DevTools.
-  experimentalDevToolsDebugging: boolean;
-  // Whether all page-like targets are exposed as pages.
-  experimentalIncludeAllPages?: boolean;
-}
-
 const DEFAULT_TIMEOUT = 5_000;
 const NAVIGATION_TIMEOUT = 10_000;
 
@@ -93,17 +86,14 @@ export class McpContext implements Context {
   #trafficSummaryCache = new Map<number, TrafficSummary>();
 
   #navigationTimeout = NAVIGATION_TIMEOUT;
-  #options: McpContextOptions;
 
   private constructor(
     browserContext: BrowserContext,
     logger: Debugger,
-    options: McpContextOptions,
   ) {
     this.browserContext = browserContext;
     this.sessionProvider = new CdpSessionProvider(browserContext);
     this.logger = logger;
-    this.#options = options;
 
     this.#networkCollector = new NetworkCollector(
       this.browserContext,
@@ -246,12 +236,8 @@ export class McpContext implements Context {
     await this.#initDebugger(frame);
   }
 
-  static async from(
-    browserContext: BrowserContext,
-    logger: Debugger,
-    opts: McpContextOptions,
-  ) {
-    const context = new McpContext(browserContext, logger, opts);
+  static async from(browserContext: BrowserContext, logger: Debugger) {
+    const context = new McpContext(browserContext, logger);
     await context.#init();
     return context;
   }
@@ -449,14 +435,9 @@ export class McpContext implements Context {
   async createPagesSnapshot(): Promise<Page[]> {
     const allPages = this.browserContext.pages();
 
-    this.#pages = allPages.filter(page => {
-      // If we allow debugging DevTools windows, return all pages.
-      // If we are in regular mode, the user should only see non-DevTools page.
-      return (
-        this.#options.experimentalDevToolsDebugging ||
-        !page.url().startsWith('devtools://')
-      );
-    });
+    this.#pages = allPages.filter(
+      page => !page.url().startsWith('devtools://'),
+    );
 
     if (!this.#selectedPage || this.#pages.indexOf(this.#selectedPage) === -1) {
       this.selectPage(this.#pages[0]);
@@ -548,7 +529,7 @@ export class McpContext implements Context {
   ): Promise<{filename: string}> {
     try {
       const dir = await fs.mkdtemp(
-        path.join(os.tmpdir(), 'chrome-devtools-mcp-'),
+        path.join(os.tmpdir(), 'js-reverse-mcp-'),
       );
 
       const filename = path.join(
