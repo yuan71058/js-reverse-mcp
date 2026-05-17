@@ -158,3 +158,8 @@ log.txt
 
 # 本地运维文档（含密钥）
 项目运维文档.md
+
+# Local AI assistant instructions (kept out of the public repo)
+CLAUDE.md
+AGENTS.md
+.codex/
